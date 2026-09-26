@@ -1,0 +1,291 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.\" Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.TH BCRAFT-RECIPE 5 "September 2026" "bcraft 0.4.0" "Basecraft Linux"
+.SH NAME
+bcraft-recipe \- create source recipes and binary packages for bcraft
+.SH DESCRIPTION
+A bcraft source package is intentionally small.  It normally contains a
+package.conf file, an executable build.sh file, and optionally patches or files
+that belong directly to the package.
+.PP
+The package author does not write MANIFEST or PKGINFO by hand.  bcraft creates
+both files automatically after build.sh has installed the package into PKGDIR.
+.PP
+This model is intended to make it easy to translate Linux From Scratch (LFS)
+and Beyond Linux From Scratch (BLFS) build instructions into reproducible
+Basecraft package recipes.
+.SH RECIPE LAYOUT
+A simple archive based recipe may look like:
+.PP
+.nf
+joe/
+|-- package.conf
+`-- build.sh
+.fi
+.PP
+A recipe that carries files directly may look like:
+.PP
+.nf
+bcraft/
+|-- package.conf
+|-- build.sh
+`-- files/
+    `-- bcraft
+.fi
+.SH PACKAGE.CONF
+package.conf is sourced by bcraft as a shell fragment.
+.PP
+The following fields are required:
+.TP
+.B name
+Package name.
+.TP
+.B version
+Upstream package version.
+.TP
+.B release
+Basecraft packaging release.
+.TP
+.B arch
+Target architecture such as x86_64, or any for architecture independent
+packages.
+.TP
+.B base
+Required Basecraft base identifier such as basecraft-1, or any for bootstrap
+packages that are not bound to one Basecraft base.
+.TP
+.B description
+Short package description.
+.TP
+.B license
+Optional license identifier.  SPDX identifiers are recommended, for example
+GPL-3.0-or-later, LGPL-3.0-or-later, MIT or BSD-2-Clause.  If omitted, bcraft records
+license=unknown in PKGINFO.
+.TP
+.B maintainer
+Optional maintainer string, for example:
+.PP
+.nf
+maintainer="Marco Welter <mawe@tamaly.de>"
+.fi
+.TP
+.B source_mode
+Either archive or recipe.
+.SH ARCHIVE SOURCES
+With source_mode="archive", also define:
+.PP
+.nf
+source_url="https://example.org/foo-1.0.tar.gz"
+source_file="foo-1.0.tar.gz"
+source_sha256="..."
+.fi
+.PP
+bcraft downloads the source into /var/cache/basecraft/sources, verifies the
+SHA-256 checksum and extracts it below the package build tree.
+.SH RECIPE SOURCES
+With source_mode="recipe", source files are contained directly in the source
+package.  This is useful for shell scripts, Basecraft tools, configuration
+packages and other small local projects.
+.SH BUILD.SH
+build.sh is executed by bcraft and must install the complete package into
+PKGDIR.  It must not install directly into the running system.
+.PP
+bcraft exports these variables:
+.TP
+.B SRCDIR
+Extracted upstream source directory, or the recipe directory for
+source_mode="recipe".
+.TP
+.B BUILDDIR
+Optional separate build directory.
+.TP
+.B PKGDIR
+Package staging root.  All package files must end up below this directory.
+.TP
+.B RECIPE_DIR
+Directory containing package.conf and build.sh.
+.TP
+.B WORKDIR
+Current package build tree.
+.TP
+.B JOBS
+Suggested parallel build job count.
+.TP
+.B PKGNAME
+Package name.
+.TP
+.B PKGVER
+Package version.
+.TP
+.B PKGRELEASE
+Package release.
+.SH TRANSLATING LFS OR BLFS INSTRUCTIONS
+For many packages an LFS/BLFS recipe can be copied almost literally.
+The important change is that the install step must target PKGDIR.
+.PP
+For example, LFS/BLFS may contain:
+.PP
+.nf
+./configure --prefix=/usr
+make
+make install
+.fi
+.PP
+A bcraft build.sh becomes:
+.PP
+.nf
+#!/bin/bash
+set -euo pipefail
+
+cd "$SRCDIR"
+
+./configure --prefix=/usr
+make -j"$JOBS"
+make DESTDIR="$PKGDIR" install
+.fi
+.PP
+If an upstream Makefile does not support DESTDIR, install individual files
+explicitly:
+.PP
+.nf
+install -Dm755 foo "$PKGDIR/usr/bin/foo"
+install -Dm644 foo.conf "$PKGDIR/etc/foo/foo.conf"
+.fi
+.PP
+Commands that modify the running system, for example systemctl, useradd,
+ldconfig or direct writes to /usr or /etc, must not simply be copied into
+build.sh.
+.SH OUT-OF-TREE BUILDS
+Projects may use BUILDDIR when supported.  For CMake, for example:
+.PP
+.nf
+cmake -S "$SRCDIR" -B "$BUILDDIR" \
+    -DCMAKE_INSTALL_PREFIX=/usr
+
+cmake --build "$BUILDDIR" -j "$JOBS"
+
+DESTDIR="$PKGDIR" \
+    cmake --install "$BUILDDIR"
+.fi
+.PP
+A separate build directory is optional.  Correct staging into PKGDIR is the
+important requirement.
+.SH CONFIGURATION FILES
+Regular files below etc/ are automatically classified as configuration files.
+Additional configuration files outside /etc may be declared in package.conf:
+.PP
+.nf
+config_files=(
+    "opt/foo/settings.conf"
+    "usr/share/foo/local.conf"
+)
+.fi
+.PP
+During updates, unchanged configuration files are replaced normally.  Locally
+modified files are preserved and the new package version is installed as
+FILE.bcraft-new.
+.SH MANIFEST GENERATION
+After build.sh completes, bcraft walks PKGDIR and creates MANIFEST
+automatically.
+.PP
+Current manifest entries have three tab separated fields:
+.PP
+.nf
+TYPE    SHA256-or--    PATH
+.fi
+.PP
+Types are:
+.TP
+.B f
+Regular package file.
+.TP
+.B c
+Configuration file.
+.TP
+.B l
+Symbolic link.
+.TP
+.B d
+Directory.
+.PP
+Only configuration files require a stored per-file SHA-256 hash for update and
+remove decisions.  Other entries use - in the checksum field.
+.PP
+Because the manifest is generated from the staged package tree, it records what
+the package actually installs rather than what the package author expected it
+to install.
+.SH SOURCE PACKAGE CREATION
+After preparing a recipe directory, create the source package with tar:
+.PP
+.nf
+tar -czf foo-1.0-1.src.tar.gz foo/
+.fi
+.PP
+Build it with:
+.PP
+.nf
+bcraft build foo-1.0-1.src.tar.gz
+.fi
+.PP
+The resulting binary package is written below:
+.PP
+.nf
+/var/cache/basecraft/packages/
+.fi
+.SH EXAMPLE: JOE
+package.conf:
+.PP
+.nf
+name="joe"
+version="4.8"
+release="1"
+arch="x86_64"
+base="basecraft-1"
+description="JOE - Joe's Own Editor"
+license="GPL-3.0-or-later"
+maintainer="Your Name <you@example.org>"
+
+source_mode="archive"
+source_url="https://example.invalid/joe-4.8.tar.gz"
+source_file="joe-4.8.tar.gz"
+source_sha256="REPLACE_WITH_REAL_SHA256"
+.fi
+.PP
+build.sh:
+.PP
+.nf
+#!/bin/bash
+set -euo pipefail
+
+cd "$SRCDIR"
+
+./configure \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --docdir="/usr/share/doc/${PKGNAME}-${PKGVER}"
+
+make -j"$JOBS"
+make DESTDIR="$PKGDIR" install
+.fi
+.SH FILES
+.TP
+.I package.conf
+Recipe metadata.
+.TP
+.I build.sh
+Package build and staging instructions.
+.TP
+.I patches/
+Optional package patches.
+.TP
+.I files/
+Optional files carried directly by the recipe.
+.SH SEE ALSO
+.BR bcraft (1),
+.BR tar (1),
+.BR sha256sum (1)
+.SH COPYRIGHT
+Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.PP
+This bcraft documentation is licensed under the GNU General Public License
+version 3 or any later version.  See /usr/share/licenses/bcraft/COPYING.

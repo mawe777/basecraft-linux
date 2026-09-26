@@ -1,0 +1,1054 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+
+set -euo pipefail
+
+BCRAFT_VERSION="0.4.0"
+
+BASECRAFT_LIB="/var/lib/basecraft"
+BASECRAFT_CACHE="/var/cache/basecraft"
+
+BUILDROOT="$BASECRAFT_LIB/build"
+DBROOT="$BASECRAFT_LIB/packages"
+
+SOURCECACHE="$BASECRAFT_CACHE/sources"
+PACKAGECACHE="$BASECRAFT_CACHE/packages"
+
+
+die()
+{
+    echo "bcraft: $*" >&2
+    exit 1
+}
+
+
+usage()
+{
+    cat <<EOF
+Usage:
+
+  bcraft build <package.src.tar.gz>
+  bcraft install <package.tar.gz>
+  bcraft update <package.tar.gz>
+  bcraft remove <package>
+  bcraft list
+  bcraft info <package>
+
+  bcraft -v
+  bcraft --version
+  bcraft -h
+  bcraft --help
+
+EOF
+}
+
+
+version()
+{
+    echo "bcraft $BCRAFT_VERSION"
+}
+
+
+require_root()
+{
+    if [ "$(id -u)" -ne 0 ]; then
+        die "This operation must be run as root"
+    fi
+}
+
+
+metadata()
+{
+    local file="$1"
+    local key="$2"
+
+    sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+
+#
+# Return true when PATH is a configuration file.
+#
+# Rules:
+#   - regular files below etc/ are config automatically
+#   - additional exact paths can be listed in config_files=(...)
+#     in package.conf
+#
+is_config_path()
+{
+    local path="$1"
+    local item
+
+    case "$path" in
+        etc/*)
+            return 0
+            ;;
+    esac
+
+    if declare -p config_files >/dev/null 2>&1; then
+        for item in "${config_files[@]}"
+        do
+            item="${item#/}"
+
+            if [ "$path" = "$item" ]; then
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+
+#
+# New manifest format:
+#
+#   TYPE<TAB>SHA256-or--<TAB>PATH
+#
+# TYPE:
+#   f  regular file
+#   c  configuration file
+#   l  symbolic link
+#   d  directory
+#
+# Older bcraft manifests used:
+#
+#   TYPE<TAB>PATH
+#
+# normalize_manifest transparently converts those old manifests.
+# Old regular files under etc/ are treated as configuration files,
+# but their original package checksum is unknown ("-").
+#
+normalize_manifest()
+{
+    local manifest="$1"
+
+    awk -F '\t' '
+    NF >= 3 {
+        type=$1
+        hash=$2
+        path=$3
+
+        for (i=4; i<=NF; i++)
+            path=path FS $i
+
+        print type "\t" hash "\t" path
+        next
+    }
+
+    NF == 2 {
+        type=$1
+        path=$2
+
+        if (type == "f" && path ~ /^etc\//)
+            type="c"
+
+        print type "\t-\t" path
+    }
+    ' "$manifest"
+}
+
+
+manifest_lookup()
+{
+    local manifest="$1"
+    local wanted="$2"
+
+    normalize_manifest "$manifest" |
+    awk -F '\t' -v wanted="$wanted" '
+        $3 == wanted {
+            print $1 "\t" $2 "\t" $3
+            exit
+        }
+    '
+}
+
+
+manifest_has()
+{
+    local manifest="$1"
+    local wanted="$2"
+
+    [ -n "$(manifest_lookup "$manifest" "$wanted")" ]
+}
+
+
+file_sha256()
+{
+    sha256sum -- "$1" | awk '{print $1}'
+}
+
+
+validate_package_path()
+{
+    local path="$1"
+
+    case "$path" in
+        ""|/*|../*|*/../*|*/..)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+
+check_arch()
+{
+    local arch="$1"
+    local system_arch
+
+    system_arch="$(uname -m)"
+
+    if [ "$arch" != "any" ] &&
+       [ "$arch" != "$system_arch" ]; then
+        die "Package architecture $arch does not match $system_arch"
+    fi
+}
+
+
+check_base()
+{
+    local base="$1"
+
+    if [ "$base" = "any" ]; then
+        return
+    fi
+
+    [ -f /etc/basecraft-release ] ||
+        die "/etc/basecraft-release missing"
+
+    local system_base
+    system_base="$(cat /etc/basecraft-release)"
+
+    [ "$base" = "$system_base" ] ||
+        die "Package requires $base, system is $system_base"
+}
+
+
+cmd_build()
+{
+    [ "$#" -eq 1 ] ||
+        die "Usage: bcraft build <package.src.tar.gz>"
+
+    local src_package
+    src_package="$(readlink -f "$1")"
+
+    [ -f "$src_package" ] ||
+        die "Source package not found: $src_package"
+
+    mkdir -p \
+        "$BUILDROOT" \
+        "$SOURCECACHE" \
+        "$PACKAGECACHE"
+
+    local recipe_tmp
+    recipe_tmp="$(mktemp -d)"
+
+    tar -xzf "$src_package" -C "$recipe_tmp"
+
+    local recipe_dir
+    recipe_dir="$(
+        find "$recipe_tmp" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -print \
+            -quit
+    )"
+
+    [ -n "$recipe_dir" ] || {
+        rm -rf "$recipe_tmp"
+        die "No recipe directory found"
+    }
+
+    [ -f "$recipe_dir/package.conf" ] || {
+        rm -rf "$recipe_tmp"
+        die "package.conf missing"
+    }
+
+    [ -x "$recipe_dir/build.sh" ] || {
+        rm -rf "$recipe_tmp"
+        die "build.sh missing or not executable"
+    }
+
+    # Reset optional recipe variables before sourcing a new recipe.
+    unset config_files || true
+
+    # shellcheck disable=SC1090
+    source "$recipe_dir/package.conf"
+
+    : "${name:?name missing}"
+    : "${version:?version missing}"
+    : "${release:?release missing}"
+    : "${arch:?arch missing}"
+    : "${base:?base missing}"
+
+    description="${description:-}"
+    license="${license:-unknown}"
+    maintainer="${maintainer:-}"
+    source_mode="${source_mode:-archive}"
+
+    case "$source_mode" in
+        archive)
+            : "${source_url:?source_url missing}"
+            : "${source_file:?source_file missing}"
+            : "${source_sha256:?source_sha256 missing}"
+            ;;
+        recipe)
+            ;;
+        *)
+            rm -rf "$recipe_tmp"
+            die "Unknown source mode: $source_mode"
+            ;;
+    esac
+
+    check_arch "$arch"
+
+    local workdir
+    workdir="$BUILDROOT/${name}-${version}-${release}"
+
+    rm -rf "$workdir"
+
+    mkdir -p \
+        "$workdir/src" \
+        "$workdir/build" \
+        "$workdir/pkg" \
+        "$workdir/package/meta" \
+        "$workdir/package/root"
+
+    local srcdir=""
+    local source_path=""
+
+    case "$source_mode" in
+        archive)
+            source_path="$SOURCECACHE/$source_file"
+
+            if [ ! -f "$source_path" ]; then
+                echo "Downloading $source_file"
+
+                wget \
+                    -O "$source_path" \
+                    "$source_url"
+            fi
+
+            echo "Checking source checksum"
+
+            echo "$source_sha256  $source_path" |
+                sha256sum -c -
+
+            echo "Extracting source"
+
+            tar \
+                -xf "$source_path" \
+                -C "$workdir/src"
+
+            srcdir="$(
+                find "$workdir/src" \
+                    -mindepth 1 \
+                    -maxdepth 1 \
+                    -type d \
+                    -print \
+                    -quit
+            )"
+
+            [ -n "$srcdir" ] || {
+                rm -rf "$recipe_tmp"
+                die "Could not determine source directory"
+            }
+            ;;
+
+        recipe)
+            srcdir="$recipe_dir"
+            ;;
+    esac
+
+    export PKGNAME="$name"
+    export PKGVER="$version"
+    export PKGRELEASE="$release"
+
+    export RECIPE_DIR="$recipe_dir"
+
+    export WORKDIR="$workdir"
+    export SRCDIR="$srcdir"
+    export BUILDDIR="$workdir/build"
+    export PKGDIR="$workdir/pkg"
+
+    export JOBS="${JOBS:-$(nproc)}"
+
+    echo
+    echo "Building $name $version-$release"
+    echo
+    echo "Source : $SRCDIR"
+    echo "Build  : $BUILDDIR"
+    echo "Package: $PKGDIR"
+    echo
+
+    "$recipe_dir/build.sh"
+
+    if [ -z "$(find "$PKGDIR" -mindepth 1 -print -quit)" ]; then
+        rm -rf "$recipe_tmp"
+        die "Package staging directory is empty"
+    fi
+
+    echo "Creating manifest"
+
+    local path rel type hash
+
+    while IFS= read -r -d '' path
+    do
+        rel="${path#"$PKGDIR"/}"
+        hash="-"
+
+        if [ -L "$path" ]; then
+            type="l"
+
+        elif [ -d "$path" ]; then
+            type="d"
+
+        elif [ -f "$path" ]; then
+            if is_config_path "$rel"; then
+                type="c"
+                hash="$(file_sha256 "$path")"
+            else
+                type="f"
+                hash="-"
+            fi
+
+        else
+            # Skip special filesystem objects in this minimal implementation.
+            continue
+        fi
+
+        printf '%s\t%s\t%s\n' \
+            "$type" "$hash" "$rel"
+
+    done < <(
+        find "$PKGDIR" \
+            -mindepth 1 \
+            -print0 |
+        LC_ALL=C sort -z
+    ) > "$workdir/package/meta/MANIFEST"
+
+    {
+        echo "name=$name"
+        echo "version=$version"
+        echo "release=$release"
+        echo "arch=$arch"
+        echo "base=$base"
+        echo "description=$description"
+        echo "license=$license"
+
+        if [ -n "$maintainer" ]; then
+            echo "maintainer=$maintainer"
+        fi
+
+        echo "source_mode=$source_mode"
+
+        if [ "$source_mode" = "archive" ]; then
+            echo "source=$source_url"
+            echo "source_sha256=$source_sha256"
+        fi
+    } > "$workdir/package/meta/PKGINFO"
+
+    cp -a \
+        "$PKGDIR"/. \
+        "$workdir/package/root/"
+
+    local package_name
+    local package_path
+
+    package_name="${name}-${version}-${release}-${arch}.tar.gz"
+    package_path="$PACKAGECACHE/$package_name"
+
+    echo "Creating binary package"
+
+    tar \
+        -czf "$package_path" \
+        -C "$workdir/package" \
+        meta \
+        root
+
+    (
+        cd "$PACKAGECACHE"
+
+        sha256sum "$package_name" \
+            > "${package_name}.sha256"
+    )
+
+    rm -rf "$recipe_tmp"
+
+    echo
+    echo "Binary package created:"
+    echo
+    echo "  $package_path"
+    echo
+}
+
+
+cmd_install()
+{
+    require_root
+
+    [ "$#" -eq 1 ] ||
+        die "Usage: bcraft install <package.tar.gz>"
+
+    local package
+    package="$(readlink -f "$1")"
+
+    [ -f "$package" ] ||
+        die "Package not found: $package"
+
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    if [ -f "${package}.sha256" ]; then
+        (
+            cd "$(dirname "$package")"
+
+            sha256sum \
+                -c "$(basename "${package}.sha256")"
+        )
+    fi
+
+    tar -xzf "$package" -C "$tmpdir"
+
+    local pkginfo="$tmpdir/meta/PKGINFO"
+    local manifest="$tmpdir/meta/MANIFEST"
+    local payload="$tmpdir/root"
+
+    [ -f "$pkginfo" ] || {
+        rm -rf "$tmpdir"
+        die "PKGINFO missing"
+    }
+
+    [ -f "$manifest" ] || {
+        rm -rf "$tmpdir"
+        die "MANIFEST missing"
+    }
+
+    [ -d "$payload" ] || {
+        rm -rf "$tmpdir"
+        die "Package payload missing"
+    }
+
+    local name version release arch base
+
+    name="$(metadata "$pkginfo" name)"
+    version="$(metadata "$pkginfo" version)"
+    release="$(metadata "$pkginfo" release)"
+    arch="$(metadata "$pkginfo" arch)"
+    base="$(metadata "$pkginfo" base)"
+
+    [ -n "$name" ] || {
+        rm -rf "$tmpdir"
+        die "Package name missing"
+    }
+
+    check_arch "$arch"
+    check_base "$base"
+
+    local dbdir="$DBROOT/$name"
+
+    mkdir -p "$DBROOT"
+
+    [ ! -e "$dbdir" ] || {
+        rm -rf "$tmpdir"
+        die "$name is already installed"
+    }
+
+    local type hash path
+
+    while IFS=$'\t' read -r type hash path
+    do
+        validate_package_path "$path" || {
+            rm -rf "$tmpdir"
+            die "Invalid package path: $path"
+        }
+
+        case "$type" in
+            f|c|l)
+                if [ -e "/$path" ] || [ -L "/$path" ]; then
+                    rm -rf "$tmpdir"
+                    die "File already exists: /$path"
+                fi
+                ;;
+        esac
+
+    done < <(normalize_manifest "$manifest")
+
+    echo "Installing $name $version-$release"
+
+    cp -a \
+        "$payload"/. \
+        /
+
+    mkdir -p "$dbdir"
+
+    cp "$pkginfo" \
+        "$dbdir/PKGINFO"
+
+    cp "$manifest" \
+        "$dbdir/MANIFEST"
+
+    rm -rf "$tmpdir"
+
+    echo "$name $version-$release installed"
+}
+
+
+cmd_update()
+{
+    require_root
+
+    [ "$#" -eq 1 ] ||
+        die "Usage: bcraft update <package.tar.gz>"
+
+    local package
+    package="$(readlink -f "$1")"
+
+    [ -f "$package" ] ||
+        die "Package not found: $package"
+
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    if [ -f "${package}.sha256" ]; then
+        (
+            cd "$(dirname "$package")"
+
+            sha256sum \
+                -c "$(basename "${package}.sha256")"
+        )
+    fi
+
+    tar -xzf "$package" -C "$tmpdir"
+
+    local pkginfo="$tmpdir/meta/PKGINFO"
+    local new_manifest="$tmpdir/meta/MANIFEST"
+    local payload="$tmpdir/root"
+
+    [ -f "$pkginfo" ] || {
+        rm -rf "$tmpdir"
+        die "PKGINFO missing"
+    }
+
+    [ -f "$new_manifest" ] || {
+        rm -rf "$tmpdir"
+        die "MANIFEST missing"
+    }
+
+    [ -d "$payload" ] || {
+        rm -rf "$tmpdir"
+        die "Package payload missing"
+    }
+
+    local name version release arch base
+
+    name="$(metadata "$pkginfo" name)"
+    version="$(metadata "$pkginfo" version)"
+    release="$(metadata "$pkginfo" release)"
+    arch="$(metadata "$pkginfo" arch)"
+    base="$(metadata "$pkginfo" base)"
+
+    [ -n "$name" ] || {
+        rm -rf "$tmpdir"
+        die "Package name missing"
+    }
+
+    check_arch "$arch"
+    check_base "$base"
+
+    local dbdir="$DBROOT/$name"
+    local old_pkginfo="$dbdir/PKGINFO"
+    local old_manifest="$dbdir/MANIFEST"
+
+    [ -d "$dbdir" ] || {
+        rm -rf "$tmpdir"
+        die "$name is not installed"
+    }
+
+    [ -f "$old_pkginfo" ] || {
+        rm -rf "$tmpdir"
+        die "Installed PKGINFO missing for $name"
+    }
+
+    [ -f "$old_manifest" ] || {
+        rm -rf "$tmpdir"
+        die "Installed MANIFEST missing for $name"
+    }
+
+    local old_name old_version old_release
+
+    old_name="$(metadata "$old_pkginfo" name)"
+    old_version="$(metadata "$old_pkginfo" version)"
+    old_release="$(metadata "$old_pkginfo" release)"
+
+    [ "$name" = "$old_name" ] || {
+        rm -rf "$tmpdir"
+        die "Package name mismatch: installed $old_name, new $name"
+    }
+
+    local type hash path old_entry old_type old_hash
+
+    #
+    # Validate paths, type changes and conflicts introduced by new files.
+    #
+    while IFS=$'\t' read -r type hash path
+    do
+        validate_package_path "$path" || {
+            rm -rf "$tmpdir"
+            die "Invalid package path: $path"
+        }
+
+        old_entry="$(manifest_lookup "$old_manifest" "$path")"
+
+        if [ -n "$old_entry" ]; then
+            IFS=$'\t' read -r old_type old_hash _ <<< "$old_entry"
+
+            if [ "$old_type" != "$type" ]; then
+                rm -rf "$tmpdir"
+                die "Path type changed for /$path ($old_type -> $type); use remove/install"
+            fi
+
+        else
+            case "$type" in
+                f|c|l)
+                    if [ -e "/$path" ] || [ -L "/$path" ]; then
+                        rm -rf "$tmpdir"
+                        die "New package file conflicts with existing path: /$path"
+                    fi
+                    ;;
+            esac
+        fi
+
+    done < <(normalize_manifest "$new_manifest")
+
+    echo "Updating $name $old_version-$old_release -> $version-$release"
+
+    #
+    # Move new configuration files out of the bulk payload.
+    # They are handled individually below.
+    #
+    local config_stage="$tmpdir/new-config"
+    mkdir -p "$config_stage"
+
+    while IFS=$'\t' read -r type hash path
+    do
+        [ "$type" = "c" ] || continue
+
+        if [ -f "$payload/$path" ]; then
+            mkdir -p "$config_stage/$(dirname "$path")"
+            cp -a "$payload/$path" "$config_stage/$path"
+            rm -f "$payload/$path"
+        fi
+
+    done < <(normalize_manifest "$new_manifest")
+
+    #
+    # Install/overwrite all normal payload files.
+    #
+    # bcraft is a special case when it updates itself.  Overwriting the
+    # currently running /usr/bin/bcraft in place can confuse bash because
+    # the interpreter may still be reading commands from that file.
+    #
+    # Therefore, remove the new bcraft binary from the bulk payload, copy
+    # the remaining payload normally, and finally replace /usr/bin/bcraft
+    # atomically with rename(2) via mv.  The running process keeps reading
+    # the old inode while subsequent invocations see the new file.
+    #
+    local self_update_source=""
+
+    if [ "$name" = "bcraft" ] &&
+       [ -f "$payload/usr/bin/bcraft" ]; then
+
+        self_update_source="$tmpdir/bcraft-self-update"
+
+        cp -a \
+            "$payload/usr/bin/bcraft" \
+            "$self_update_source"
+
+        rm -f -- "$payload/usr/bin/bcraft"
+    fi
+
+    cp -a \
+        "$payload"/. \
+        /
+
+    if [ -n "$self_update_source" ]; then
+        local self_update_tmp="/usr/bin/.bcraft.new.$$"
+
+        rm -f -- "$self_update_tmp"
+
+        cp -a \
+            "$self_update_source" \
+            "$self_update_tmp"
+
+        mv -f -- \
+            "$self_update_tmp" \
+            /usr/bin/bcraft
+    fi
+
+    #
+    # Handle configuration files.
+    #
+    while IFS=$'\t' read -r type hash path
+    do
+        [ "$type" = "c" ] || continue
+
+        local new_config="$config_stage/$path"
+        local target="/$path"
+
+        [ -f "$new_config" ] || continue
+
+        old_entry="$(manifest_lookup "$old_manifest" "$path")"
+
+        if [ -z "$old_entry" ]; then
+            mkdir -p "$(dirname "$target")"
+            cp -a "$new_config" "$target"
+            continue
+        fi
+
+        IFS=$'\t' read -r old_type old_hash _ <<< "$old_entry"
+
+        if [ ! -e "$target" ]; then
+            mkdir -p "$(dirname "$target")"
+            cp -a "$new_config" "$target"
+            continue
+        fi
+
+        #
+        # If we know the old package hash and the current file still has
+        # exactly that hash, the administrator has not modified it.
+        #
+        if [ "$old_hash" != "-" ] &&
+           [ "$(file_sha256 "$target")" = "$old_hash" ]; then
+
+            cp -a "$new_config" "$target"
+
+        else
+            #
+            # Modified config or legacy manifest without an old hash:
+            # keep the local version and place the new package version next
+            # to it.
+            #
+            cp -a "$new_config" "${target}.bcraft-new"
+
+            echo "Preserving modified config: $target"
+            echo "New package config written to: ${target}.bcraft-new"
+        fi
+
+    done < <(normalize_manifest "$new_manifest")
+
+    #
+    # Remove paths that existed in the old package but no longer exist
+    # in the new package.
+    #
+    while IFS=$'\t' read -r type hash path
+    do
+        if manifest_has "$new_manifest" "$path"; then
+            continue
+        fi
+
+        case "$type" in
+            f|l)
+                rm -f -- "/$path"
+                ;;
+
+            c)
+                #
+                # Remove an obsolete config only when it is provably
+                # unmodified. Otherwise preserve it as local state.
+                #
+                if [ -f "/$path" ] &&
+                   [ "$hash" != "-" ] &&
+                   [ "$(file_sha256 "/$path")" = "$hash" ]; then
+
+                    rm -f -- "/$path"
+
+                elif [ -e "/$path" ]; then
+                    echo "Preserving obsolete modified config: /$path"
+                fi
+                ;;
+        esac
+
+    done < <(normalize_manifest "$old_manifest")
+
+    #
+    # Remove obsolete empty directories in reverse order.
+    #
+    normalize_manifest "$old_manifest" |
+    tac |
+    while IFS=$'\t' read -r type hash path
+    do
+        if [ "$type" = "d" ] &&
+           ! manifest_has "$new_manifest" "$path"; then
+
+            rmdir -- "/$path" 2>/dev/null || true
+        fi
+    done
+
+    cp "$pkginfo" "$dbdir/PKGINFO"
+    cp "$new_manifest" "$dbdir/MANIFEST"
+
+    rm -rf "$tmpdir"
+
+    echo "$name updated to $version-$release"
+}
+
+
+cmd_remove()
+{
+    require_root
+
+    [ "$#" -eq 1 ] ||
+        die "Usage: bcraft remove <package>"
+
+    local name="$1"
+
+    local dbdir="$DBROOT/$name"
+    local manifest="$dbdir/MANIFEST"
+
+    [ -d "$dbdir" ] ||
+        die "$name is not installed"
+
+    [ -f "$manifest" ] ||
+        die "Manifest missing for $name"
+
+    echo "Removing $name"
+
+    local type hash path
+
+    while IFS=$'\t' read -r type hash path
+    do
+        case "$type" in
+            f|l)
+                rm -f -- "/$path"
+                ;;
+
+            c)
+                if [ ! -e "/$path" ]; then
+                    continue
+                fi
+
+                if [ "$hash" != "-" ] &&
+                   [ "$(file_sha256 "/$path")" = "$hash" ]; then
+
+                    rm -f -- "/$path"
+
+                else
+                    echo "Preserving modified config: /$path"
+                fi
+                ;;
+        esac
+
+    done < <(normalize_manifest "$manifest")
+
+    normalize_manifest "$manifest" |
+    tac |
+    while IFS=$'\t' read -r type hash path
+    do
+        if [ "$type" = "d" ]; then
+            rmdir -- "/$path" 2>/dev/null || true
+        fi
+    done
+
+    rm -rf "$dbdir"
+
+    echo "$name removed"
+}
+
+
+cmd_list()
+{
+    if [ ! -d "$DBROOT" ]; then
+        return
+    fi
+
+    local dir
+
+    for dir in "$DBROOT"/*
+    do
+        [ -d "$dir" ] ||
+            continue
+
+        local pkginfo="$dir/PKGINFO"
+
+        if [ -f "$pkginfo" ]; then
+            local name
+            local version
+            local release
+
+            name="$(metadata "$pkginfo" name)"
+            version="$(metadata "$pkginfo" version)"
+            release="$(metadata "$pkginfo" release)"
+
+            printf '%-25s %s-%s\n' \
+                "$name" \
+                "$version" \
+                "$release"
+        fi
+    done
+}
+
+
+cmd_info()
+{
+    [ "$#" -eq 1 ] ||
+        die "Usage: bcraft info <package>"
+
+    local pkginfo="$DBROOT/$1/PKGINFO"
+
+    [ -f "$pkginfo" ] ||
+        die "$1 is not installed"
+
+    cat "$pkginfo"
+}
+
+
+if [ "$#" -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    build)
+        cmd_build "$@"
+        ;;
+
+    install)
+        cmd_install "$@"
+        ;;
+
+    update)
+        cmd_update "$@"
+        ;;
+
+    remove)
+        cmd_remove "$@"
+        ;;
+
+    list)
+        cmd_list "$@"
+        ;;
+
+    info)
+        cmd_info "$@"
+        ;;
+
+    -v|--version|version)
+        version
+        ;;
+
+    -h|--help|help)
+        usage
+        ;;
+
+    *)
+        die "Unknown command: $command"
+        ;;
+esac

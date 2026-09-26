@@ -1,0 +1,174 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.\" Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.TH BCRAFT 1 "September 2026" "bcraft 0.4.0" "Basecraft Linux"
+.SH NAME
+bcraft \- kleines Build- und Binärpaket-Werkzeug für Basecraft Linux
+.SH ÜBERSICHT
+.B bcraft
+.B build
+.I paket.src.tar.gz
+.PP
+.B bcraft
+.B install
+.I paket.tar.gz
+.PP
+.B bcraft
+.B update
+.I paket.tar.gz
+.PP
+.B bcraft
+.B remove
+.I paket
+.PP
+.B bcraft
+.B list
+.PP
+.B bcraft
+.B info
+.I paket
+.PP
+.B bcraft
+.BR -v " | " --version
+.PP
+.B bcraft
+.BR -h " | " --help
+.SH BESCHREIBUNG
+.B bcraft
+ist ein bewusst kleines Build- und Paketwerkzeug für Basecraft Linux.
+Im Mittelpunkt stehen reproduzierbare Paketrezepte, Installation in ein
+Staging-Verzeichnis, Binärpakete als tar.gz, Manifeste und eine kleine lokale
+Paketdatenbank.
+.PP
+bcraft besitzt keine automatische Dependency-Auflösung und keine komplexen
+Repository-Transaktionen. Das jeweilige Paket-Rezept beschreibt, wie Software
+gebaut und installiert wird.
+.SH BEFEHLE
+.TP
+.BI "build " paket.src.tar.gz
+Baut ein Source-Rezept. Archiv-Sources werden heruntergeladen und geprüft,
+das Build-Rezept wird ausgeführt, die Dateien werden in PKGDIR gestaged,
+ein Manifest wird erzeugt und das Binärpaket unter
+/var/cache/basecraft/packages abgelegt.
+.TP
+.BI "install " paket.tar.gz
+Installiert ein Binärpaket und speichert PKGINFO und MANIFEST unter
+/var/lib/basecraft/packages.
+.TP
+.BI "update " paket.tar.gz
+Aktualisiert ein bereits installiertes Paket. Gemeinsame Paketdateien werden
+ersetzt, nicht mehr enthaltene Dateien werden entfernt und die Paketmetadaten
+werden aktualisiert. Konfigurationsdateien werden besonders behandelt.
+.TP
+.BI "remove " paket
+Entfernt die zu einem installierten Paket gehörenden Dateien. Gemeinsam
+verwendete, nicht leere Verzeichnisse bleiben bestehen.
+.TP
+.B list
+Zeigt installierte Pakete und deren Versionen.
+.TP
+.BI "info " paket
+Zeigt PKGINFO eines installierten Pakets.
+.TP
+.BR -v ", " --version
+Zeigt die bcraft-Version.
+.TP
+.BR -h ", " --help
+Zeigt die Kommandoübersicht.
+.SH SOURCE-REZEPTE
+Ein Rezept enthält normalerweise package.conf und ein ausführbares build.sh.
+.PP
+Archivbasierte Pakete verwenden source_mode="archive" sowie source_url,
+source_file und source_sha256.
+.PP
+Pakete, deren Source direkt im Rezept enthalten ist, können
+source_mode="recipe" verwenden.
+.SH KONFIGURATIONSDATEIEN
+Reguläre Dateien unterhalb von /etc werden automatisch als
+Konfigurationsdateien behandelt.
+.PP
+Zusätzliche Konfigurationsdateien außerhalb von /etc können in package.conf
+angegeben werden:
+.PP
+.nf
+config_files=(
+    "opt/example/settings.conf"
+    "usr/share/example/local.conf"
+)
+.fi
+.PP
+Die Pfade werden relativ zum Root-Dateisystem angegeben.
+.PP
+Für Konfigurationsdateien speichert bcraft den SHA-256-Hash der Paketversion im
+Manifest. Bei einem Update wird eine Konfigurationsdatei normal ersetzt, wenn
+die installierte Datei noch exakt dem Hash der alten Paketversion entspricht.
+Wurde die lokale Datei verändert, bleibt sie erhalten und die neue Paketversion
+wird daneben abgelegt als:
+.PP
+.nf
+/pfad/zur/datei.bcraft-new
+.fi
+.PP
+Enthält ein älteres bcraft-Manifest noch keinen Hash für die
+Konfigurationsdatei, verhält sich bcraft vorsichtig: Die vorhandene Datei bleibt
+bestehen und die neue Paketversion wird als .bcraft-new abgelegt.
+.PP
+Beim Entfernen eines Pakets wird eine unveränderte Konfigurationsdatei gelöscht.
+Eine lokal veränderte Konfigurationsdatei bleibt erhalten.
+.SH MANIFEST
+Aktuelle Manifeste besitzen drei durch Tabulator getrennte Felder:
+.PP
+.nf
+TYP    SHA256-oder--    PFAD
+.fi
+.PP
+Die Typen sind:
+.TP
+.B f
+normale Paketdatei
+.TP
+.B c
+Konfigurationsdatei
+.TP
+.B l
+symbolischer Link
+.TP
+.B d
+Verzeichnis
+.PP
+bcraft kann weiterhin das ältere zweispaltige Manifestformat von bcraft 0.2.x
+lesen.
+.SH DATEIEN
+.TP
+.I /etc/basecraft-release
+Basecraft-Basiskennung für die Kompatibilitätsprüfung.
+.TP
+.I /var/lib/basecraft/build
+Build-Verzeichnisse der Pakete.
+.TP
+.I /var/lib/basecraft/packages
+Lokale Datenbank installierter Pakete.
+.TP
+.I /var/cache/basecraft/sources
+Cache heruntergeladener Source-Archive.
+.TP
+.I /var/cache/basecraft/packages
+Cache erzeugter Binärpakete.
+.SH HINWEISE
+Pakete mit base=any benötigen keine /etc/basecraft-release. Das eignet sich
+beispielsweise für architekturunabhängige Bootstrap-Werkzeuge wie bcraft selbst.
+.PP
+Benutzerkonfigurationen wie ~/.config werden von bcraft nicht verwaltet, sofern
+ein Paket solche Dateien nicht ausdrücklich in seinen Payload installiert.
+Normale Pakete sollten das nicht tun.
+.SH SIEHE AUCH
+.BR bcraft-recipe (5),
+.BR tar (1),
+.BR sha256sum (1)
+.SH AUTOR
+Marco Welter <mawe@tamaly.de>
+.SH COPYRIGHT
+Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.PP
+bcraft steht ausschließlich unter der GNU General Public License Version 3 oder jeder späteren Version.
+Der vollständige Lizenztext befindet sich in
+/usr/share/licenses/bcraft/COPYING.

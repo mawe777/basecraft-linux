@@ -1,0 +1,167 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.\" Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.TH BCRAFT 1 "September 2026" "bcraft 0.4.0" "Basecraft Linux"
+.SH NAME
+bcraft \- small build and binary package tool for Basecraft Linux
+.SH SYNOPSIS
+.B bcraft
+.B build
+.I package.src.tar.gz
+.PP
+.B bcraft
+.B install
+.I package.tar.gz
+.PP
+.B bcraft
+.B update
+.I package.tar.gz
+.PP
+.B bcraft
+.B remove
+.I package
+.PP
+.B bcraft
+.B list
+.PP
+.B bcraft
+.B info
+.I package
+.PP
+.B bcraft
+.BR -v " | " --version
+.PP
+.B bcraft
+.BR -h " | " --help
+.SH DESCRIPTION
+.B bcraft
+is a deliberately small build and package management tool for Basecraft Linux.
+It is designed around reproducible package recipes, staged installation into a
+package directory, binary tar.gz packages, manifests, and a small local package
+database.
+.PP
+bcraft does not perform automatic dependency solving or repository transactions.
+Package recipes are expected to describe how software is built and installed.
+.SH COMMANDS
+.TP
+.BI "build " package.src.tar.gz
+Build a source recipe. Archive sources are downloaded and verified, the recipe
+is executed, files are staged in PKGDIR, a manifest is generated, and a binary
+package is written below /var/cache/basecraft/packages.
+.TP
+.BI "install " package.tar.gz
+Install a binary package and register its PKGINFO and MANIFEST below
+/var/lib/basecraft/packages.
+.TP
+.BI "update " package.tar.gz
+Update an already installed package. Files present in both package versions are
+replaced, obsolete package files are removed, and package metadata is updated.
+Configuration files receive special handling as described below.
+.TP
+.BI "remove " package
+Remove files belonging to an installed package. Shared non-empty directories are
+left in place.
+.TP
+.B list
+List installed packages and their versions.
+.TP
+.BI "info " package
+Display PKGINFO for an installed package.
+.TP
+.BR -v ", " --version
+Display the bcraft version.
+.TP
+.BR -h ", " --help
+Display command usage.
+.SH SOURCE RECIPES
+A recipe normally contains package.conf and an executable build.sh.
+.PP
+Archive based packages use source_mode="archive" together with source_url,
+source_file and source_sha256.
+.PP
+Packages whose source is contained directly in the recipe may use
+source_mode="recipe".
+.SH CONFIGURATION FILES
+Regular files below /etc are automatically treated as configuration files.
+Additional configuration files outside /etc can be declared in package.conf:
+.PP
+.nf
+config_files=(
+    "opt/example/settings.conf"
+    "usr/share/example/local.conf"
+)
+.fi
+.PP
+Paths are relative to the filesystem root.
+.PP
+For configuration files bcraft stores the SHA-256 hash of the package version
+in the package manifest. During update, if the installed file still matches the
+old package hash, it is replaced normally. If the local file was modified, the
+local file is preserved and the new package version is written as:
+.PP
+.nf
+/path/to/file.bcraft-new
+.fi
+.PP
+When an older bcraft manifest does not contain configuration hashes, bcraft
+uses the conservative behavior and preserves the existing configuration while
+writing the new package version as .bcraft-new.
+.PP
+During removal, an unchanged configuration file is removed. A modified
+configuration file is preserved.
+.SH MANIFEST
+Current manifests use three tab-separated fields:
+.PP
+.nf
+TYPE    SHA256-or--    PATH
+.fi
+.PP
+Types are:
+.TP
+.B f
+regular package file
+.TP
+.B c
+configuration file
+.TP
+.B l
+symbolic link
+.TP
+.B d
+directory
+.PP
+bcraft can also read the older two-field manifest format used by bcraft 0.2.x.
+.SH FILES
+.TP
+.I /etc/basecraft-release
+Basecraft base identifier used for package compatibility checks.
+.TP
+.I /var/lib/basecraft/build
+Package build trees.
+.TP
+.I /var/lib/basecraft/packages
+Installed package database.
+.TP
+.I /var/cache/basecraft/sources
+Downloaded source archive cache.
+.TP
+.I /var/cache/basecraft/packages
+Built binary package cache.
+.SH NOTES
+Packages with base=any do not require /etc/basecraft-release. This is useful for
+architecture-independent bootstrap tools such as bcraft itself.
+.PP
+Home directory configuration such as ~/.config is not managed by bcraft unless
+a package explicitly installs such files into the package payload, which normal
+packages should not do.
+.SH SEE ALSO
+.BR bcraft-recipe (5),
+.BR tar (1),
+.BR sha256sum (1)
+.SH AUTHOR
+Marco Welter <mawe@tamaly.de>
+.SH COPYRIGHT
+Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
+.PP
+bcraft is licensed under the GNU General Public License version 3 or any later version.
+The complete license text is installed as
+/usr/share/licenses/bcraft/COPYING.

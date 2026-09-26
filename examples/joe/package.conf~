@@ -1,0 +1,13 @@
+name="joe"
+version="4.6"
+release="1"
+
+arch="x86_64"
+base="basecraft-1"
+
+description="JOE - Joe's Own Editor"
+
+source_mode="archive"
+source_url="https://downloads.sourceforge.net/joe-editor/joe-4.6.tar.gz"
+source_file="joe-4.6.tar.gz"
+source_sha256="495a0a61f26404070fe8a719d80406dc7f337623788e445b92a9f6de512ab9de"
