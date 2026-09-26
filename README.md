@@ -1,5 +1,8 @@
 # Basecraft Linux
 
+[Deutsch](README.DE.md)
+
+
 Basecraft Linux is a small experimental build and binary package layer for Linux From Scratch based systems.
 
 It started as a personal project on top of an installed Umbra Linux (https://umbralinux.org) system. The goal is not to create another full distribution package manager and not to replace tools such as RPM/DNF, dpkg/APT or pacman.
