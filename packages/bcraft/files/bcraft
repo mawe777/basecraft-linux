@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-BCRAFT_VERSION="0.4.0"
+BCRAFT_VERSION="0.6.0"
 
 BASECRAFT_LIB="/var/lib/basecraft"
 BASECRAFT_CACHE="/var/cache/basecraft"
@@ -28,9 +28,10 @@ usage()
     cat <<EOF
 Usage:
 
-  bcraft build <package.src.tar.gz>
-  bcraft install <package.tar.gz>
-  bcraft update <package.tar.gz>
+  bcraft build <package.src.bcraft>
+  bcraft src-build [recipe-dir]
+  bcraft install [--nodeps] <package.bcraft>
+  bcraft update [--nodeps] <package.bcraft>
   bcraft remove <package>
   bcraft list
   bcraft info <package>
@@ -64,6 +65,15 @@ metadata()
     local key="$2"
 
     sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+
+metadata_all()
+{
+    local file="$1"
+    local key="$2"
+
+    sed -n "s/^${key}=//p" "$file"
 }
 
 
@@ -227,10 +237,248 @@ check_base()
 }
 
 
+validate_dependency_name()
+{
+    local dependency="$1"
+
+    [[ "$dependency" =~ ^[A-Za-z0-9][A-Za-z0-9+_.-]*$ ]]
+}
+
+
+dependency_installed()
+{
+    local dependency="$1"
+    local pkginfo="$DBROOT/$dependency/PKGINFO"
+
+    [ -f "$pkginfo" ] ||
+        return 1
+
+    [ "$(metadata "$pkginfo" name)" = "$dependency" ]
+}
+
+
+check_dependencies()
+{
+    local pkginfo="$1"
+    local package_name="$2"
+    local nodeps="$3"
+
+    [ "$nodeps" -eq 0 ] ||
+        return 0
+
+    local dependency
+    local -a missing=()
+
+    while IFS= read -r dependency
+    do
+        [ -n "$dependency" ] ||
+            continue
+
+        if ! validate_dependency_name "$dependency"; then
+            echo "bcraft: Invalid dependency name in $package_name: $dependency" >&2
+            return 1
+        fi
+
+        if ! dependency_installed "$dependency"; then
+            missing+=("$dependency")
+        fi
+
+    done < <(metadata_all "$pkginfo" depend)
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        return
+    fi
+
+    echo "bcraft: Missing dependencies for $package_name:" >&2
+
+    for dependency in "${missing[@]}"
+    do
+        echo "  $dependency" >&2
+    done
+
+    echo "bcraft: Use --nodeps to skip dependency checks" >&2
+    return 1
+}
+
+
+parse_package_command_args()
+{
+    local command="$1"
+    shift
+
+    NODEPS=0
+    PACKAGE_ARG=""
+
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+            --nodeps)
+                NODEPS=1
+                ;;
+
+            --)
+                shift
+                [ "$#" -eq 1 ] ||
+                    die "Usage: bcraft $command [--nodeps] <package.bcraft>"
+                PACKAGE_ARG="$1"
+                shift
+                break
+                ;;
+
+            -*)
+                die "Unknown option for $command: $1"
+                ;;
+
+            *)
+                [ -z "$PACKAGE_ARG" ] ||
+                    die "Usage: bcraft $command [--nodeps] <package.bcraft>"
+                PACKAGE_ARG="$1"
+                ;;
+        esac
+
+        shift
+    done
+
+    [ -n "$PACKAGE_ARG" ] ||
+        die "Usage: bcraft $command [--nodeps] <package.bcraft>"
+}
+
+
+validate_sha256()
+{
+    local hash="$1"
+    local context="$2"
+
+    [ "$hash" != "AUTO" ] ||
+        die "AUTO is only allowed with bcraft src-build ($context)"
+
+    [[ "$hash" =~ ^[0-9A-Fa-f]{64}$ ]] ||
+        die "Invalid SHA-256 for $context: $hash"
+}
+
+
+cmd_src_build()
+{
+    [ "$#" -le 1 ] ||
+        die "Usage: bcraft src-build [recipe-dir]"
+
+    local input_dir="${1:-.}"
+    input_dir="$(readlink -f "$input_dir")"
+
+    [ -d "$input_dir" ] || die "Recipe directory not found: $input_dir"
+    [ -f "$input_dir/package.conf" ] || die "package.conf missing"
+    [ -f "$input_dir/build.sh" ] || die "build.sh missing"
+
+    local tmp copy_dir
+    tmp="$(mktemp -d)"
+    copy_dir="$tmp/recipe"
+    cp -a -- "$input_dir" "$copy_dir"
+
+    unset config_files depends source_urls source_files source_sha256s || true
+    unset source_url source_file source_sha256 source_mode || true
+    # shellcheck disable=SC1090
+    source "$copy_dir/package.conf"
+
+    : "${name:?name missing}"
+    : "${version:?version missing}"
+    : "${release:?release missing}"
+    source_mode="${source_mode:-archive}"
+
+    local -a auto_hashes=()
+    local i hash url file downloaded
+
+    case "$source_mode" in
+        archive)
+            if declare -p source_urls >/dev/null 2>&1; then
+                declare -p source_files >/dev/null 2>&1 || die "source_files missing"
+                declare -p source_sha256s >/dev/null 2>&1 || die "source_sha256s missing"
+                [ "${#source_urls[@]}" -gt 0 ] || die "No sources defined"
+                [ "${#source_urls[@]}" -eq "${#source_files[@]}" ] || die "source_urls/source_files length mismatch"
+                [ "${#source_urls[@]}" -eq "${#source_sha256s[@]}" ] || die "source_urls/source_sha256s length mismatch"
+
+                for i in "${!source_files[@]}"; do
+                    file="${source_files[$i]}"
+                    hash="${source_sha256s[$i]}"
+                    url="${source_urls[$i]}"
+                    [ -n "$file" ] || die "Empty source filename at index $i"
+                    [ "$(basename -- "$file")" = "$file" ] || die "Invalid source filename: $file"
+                    if [ "$hash" = "AUTO" ]; then
+                        downloaded="$tmp/source-$i"
+                        echo "Downloading $file for SHA-256"
+                        wget -O "$downloaded" "$url"
+                        auto_hashes+=("$(file_sha256 "$downloaded")")
+                    elif ! [[ "$hash" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+                        die "Invalid SHA-256 for $file: $hash"
+                    fi
+                done
+            else
+                : "${source_url:?source_url missing}"
+                : "${source_file:?source_file missing}"
+                : "${source_sha256:?source_sha256 missing}"
+                [ "$(basename -- "$source_file")" = "$source_file" ] || die "Invalid source filename: $source_file"
+                if [ "$source_sha256" = "AUTO" ]; then
+                    downloaded="$tmp/source-0"
+                    echo "Downloading $source_file for SHA-256"
+                    wget -O "$downloaded" "$source_url"
+                    auto_hashes+=("$(file_sha256 "$downloaded")")
+                elif ! [[ "$source_sha256" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+                    die "Invalid SHA-256 for $source_file: $source_sha256"
+                fi
+            fi
+            ;;
+        local)
+            if declare -p source_sha256s >/dev/null 2>&1; then
+                for hash in "${source_sha256s[@]}"; do
+                    [ "$hash" != "AUTO" ] || die "AUTO is not supported for source_mode=local"
+                done
+            fi
+            ;;
+        recipe)
+            ;;
+        *) die "Unknown source mode: $source_mode" ;;
+    esac
+
+    if [ "${#auto_hashes[@]}" -gt 0 ]; then
+        local hashes_file="$tmp/hashes"
+        printf '%s\n' "${auto_hashes[@]}" > "$hashes_file"
+        awk -v hf="$hashes_file" '
+            BEGIN { n=0; while ((getline h < hf) > 0) hashes[++n]=h; close(hf); idx=1; in_array=0 }
+            /^[[:space:]]*source_sha256[[:space:]]*=/ {
+                if ($0 ~ /[\047\"]AUTO[\047\"]/) sub(/[\047\"]AUTO[\047\"]/, "\"" hashes[idx++] "\"")
+                print; next
+            }
+            /^[[:space:]]*source_sha256s[[:space:]]*=\(/ { in_array=1; print; next }
+            in_array {
+                if ($0 ~ /^[[:space:]]*\)/) { in_array=0; print; next }
+                if ($0 ~ /[\047\"]AUTO[\047\"]/) sub(/[\047\"]AUTO[\047\"]/, "\"" hashes[idx++] "\"")
+                print; next
+            }
+            { print }
+            END { if (idx-1 != n) exit 42 }
+        ' "$copy_dir/package.conf" > "$copy_dir/package.conf.new" || {
+            rm -rf "$tmp"
+            die "Could not replace AUTO checksums in package.conf copy"
+        }
+        mv "$copy_dir/package.conf.new" "$copy_dir/package.conf"
+    fi
+
+    local package_dir_name="${name}-${version}-${release}"
+    local stage="$tmp/stage"
+    mkdir -p "$stage/$package_dir_name"
+    cp -a -- "$copy_dir"/. "$stage/$package_dir_name/"
+
+    local output="$PWD/${name}-${version}-${release}.src.bcraft"
+    tar -czf "$output" -C "$stage" "$package_dir_name"
+    rm -rf "$tmp"
+
+    echo "Created $output"
+}
+
+
 cmd_build()
 {
     [ "$#" -eq 1 ] ||
-        die "Usage: bcraft build <package.src.tar.gz>"
+        die "Usage: bcraft build <package.src.bcraft>"
 
     local src_package
     src_package="$(readlink -f "$1")"
@@ -274,7 +522,7 @@ cmd_build()
     }
 
     # Reset optional recipe variables before sourcing a new recipe.
-    unset config_files || true
+    unset config_files depends source_urls source_files source_sha256s || true
 
     # shellcheck disable=SC1090
     source "$recipe_dir/package.conf"
@@ -290,11 +538,32 @@ cmd_build()
     maintainer="${maintainer:-}"
     source_mode="${source_mode:-archive}"
 
+    # Normalize legacy single-source archive recipes to the multi-source model.
+    # New recipes use source_urls/source_files/source_sha256s arrays.
     case "$source_mode" in
         archive)
-            : "${source_url:?source_url missing}"
-            : "${source_file:?source_file missing}"
-            : "${source_sha256:?source_sha256 missing}"
+            if ! declare -p source_urls >/dev/null 2>&1; then
+                : "${source_url:?source_url missing}"
+                : "${source_file:?source_file missing}"
+                : "${source_sha256:?source_sha256 missing}"
+                source_urls=("$source_url")
+                source_files=("$source_file")
+                source_sha256s=("$source_sha256")
+            fi
+
+            declare -p source_files >/dev/null 2>&1 || die "source_files missing"
+            declare -p source_sha256s >/dev/null 2>&1 || die "source_sha256s missing"
+
+            [ "${#source_urls[@]}" -gt 0 ] || die "No sources defined"
+            [ "${#source_urls[@]}" -eq "${#source_files[@]}" ] || die "source_urls/source_files length mismatch"
+            [ "${#source_urls[@]}" -eq "${#source_sha256s[@]}" ] || die "source_urls/source_sha256s length mismatch"
+            ;;
+        local)
+            declare -p source_files >/dev/null 2>&1 || die "source_files missing"
+            declare -p source_sha256s >/dev/null 2>&1 || die "source_sha256s missing"
+
+            [ "${#source_files[@]}" -gt 0 ] || die "No sources defined"
+            [ "${#source_files[@]}" -eq "${#source_sha256s[@]}" ] || die "source_files/source_sha256s length mismatch"
             ;;
         recipe)
             ;;
@@ -320,49 +589,83 @@ cmd_build()
 
     local srcdir=""
     local source_path=""
+    local source_index source_name source_hash source_url_item
+    local -a resolved_sources=()
 
     case "$source_mode" in
         archive)
-            source_path="$SOURCECACHE/$source_file"
+            for source_index in "${!source_files[@]}"
+            do
+                source_name="${source_files[$source_index]}"
+                source_hash="${source_sha256s[$source_index]}"
+                source_url_item="${source_urls[$source_index]}"
 
-            if [ ! -f "$source_path" ]; then
-                echo "Downloading $source_file"
+                [ -n "$source_name" ] || die "Empty source filename at index $source_index"
+                [ "$(basename -- "$source_name")" = "$source_name" ] || die "Invalid source filename: $source_name"
 
-                wget \
-                    -O "$source_path" \
-                    "$source_url"
-            fi
+                validate_sha256 "$source_hash" "$source_name"
+                source_path="$SOURCECACHE/$source_name"
 
-            echo "Checking source checksum"
+                if [ ! -f "$source_path" ]; then
+                    echo "Downloading $source_name"
+                    wget -O "$source_path" "$source_url_item"
+                fi
 
-            echo "$source_sha256  $source_path" |
-                sha256sum -c -
+                echo "Checking source checksum: $source_name"
+                echo "$source_hash  $source_path" | sha256sum -c -
+                resolved_sources+=("$source_path")
+            done
+            ;;
 
-            echo "Extracting source"
+        local)
+            for source_index in "${!source_files[@]}"
+            do
+                source_name="${source_files[$source_index]}"
+                source_hash="${source_sha256s[$source_index]}"
 
-            tar \
-                -xf "$source_path" \
-                -C "$workdir/src"
+                [ -n "$source_name" ] || die "Empty source filename at index $source_index"
+                [ "$(basename -- "$source_name")" = "$source_name" ] || die "Invalid source filename: $source_name"
 
-            srcdir="$(
-                find "$workdir/src" \
-                    -mindepth 1 \
-                    -maxdepth 1 \
-                    -type d \
-                    -print \
-                    -quit
-            )"
+                source_path="$recipe_dir/sources/$source_name"
+                [ -f "$source_path" ] || die "Local source missing: sources/$source_name"
 
-            [ -n "$srcdir" ] || {
-                rm -rf "$recipe_tmp"
-                die "Could not determine source directory"
-            }
+                validate_sha256 "$source_hash" "$source_name"
+                echo "Checking source checksum: $source_name"
+                echo "$source_hash  $source_path" | sha256sum -c -
+                resolved_sources+=("$source_path")
+            done
             ;;
 
         recipe)
             srcdir="$recipe_dir"
             ;;
     esac
+
+    if [ "$source_mode" = "archive" ] || [ "$source_mode" = "local" ]; then
+        echo "Extracting primary source: ${source_files[0]}"
+        tar -xf "${resolved_sources[0]}" -C "$workdir/src"
+
+        srcdir="$(
+            find "$workdir/src" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -print \
+                -quit
+        )"
+
+        [ -n "$srcdir" ] || {
+            rm -rf "$recipe_tmp"
+            die "Could not determine source directory"
+        }
+
+        # Additional sources are intentionally not unpacked.  Make them
+        # available by their declared filenames in SRCDIR for build.sh.
+        for ((source_index=1; source_index<${#resolved_sources[@]}; source_index++))
+        do
+            cp -f -- "${resolved_sources[$source_index]}" "$srcdir/${source_files[$source_index]}"
+        done
+    fi
 
     export PKGNAME="$name"
     export PKGVER="$version"
@@ -444,11 +747,35 @@ cmd_build()
             echo "maintainer=$maintainer"
         fi
 
+        if declare -p depends >/dev/null 2>&1; then
+            local dependency
+
+            for dependency in "${depends[@]}"
+            do
+                validate_dependency_name "$dependency" || {
+                    rm -rf "$recipe_tmp"
+                    die "Invalid dependency name: $dependency"
+                }
+
+                echo "depend=$dependency"
+            done
+        fi
+
         echo "source_mode=$source_mode"
 
         if [ "$source_mode" = "archive" ]; then
-            echo "source=$source_url"
-            echo "source_sha256=$source_sha256"
+            for source_index in "${!source_files[@]}"
+            do
+                echo "source=${source_urls[$source_index]}"
+                echo "source_file=${source_files[$source_index]}"
+                echo "source_sha256=${source_sha256s[$source_index]}"
+            done
+        elif [ "$source_mode" = "local" ]; then
+            for source_index in "${!source_files[@]}"
+            do
+                echo "source_file=${source_files[$source_index]}"
+                echo "source_sha256=${source_sha256s[$source_index]}"
+            done
         fi
     } > "$workdir/package/meta/PKGINFO"
 
@@ -459,7 +786,7 @@ cmd_build()
     local package_name
     local package_path
 
-    package_name="${name}-${version}-${release}-${arch}.tar.gz"
+    package_name="${name}-${version}-${release}.bcraft"
     package_path="$PACKAGECACHE/$package_name"
 
     echo "Creating binary package"
@@ -487,15 +814,82 @@ cmd_build()
 }
 
 
+
+# Compare two version/release strings using natural numeric/alphabetic segments.
+# Prints -1 when A < B, 0 when equal, 1 when A > B.
+version_compare()
+{
+    local a="$1"
+    local b="$2"
+
+    python3 - "$a" "$b" <<'PYVERSION'
+import re, sys
+
+def tokens(value):
+    return re.findall(r'[0-9]+|[A-Za-z]+', value)
+
+def cmp(a, b):
+    ta, tb = tokens(a), tokens(b)
+    for x, y in zip(ta, tb):
+        if x.isdigit() and y.isdigit():
+            xi, yi = int(x), int(y)
+            if xi != yi:
+                return 1 if xi > yi else -1
+        elif x.isdigit() != y.isdigit():
+            # Numeric release/version components sort after alphabetic qualifiers.
+            return 1 if x.isdigit() else -1
+        else:
+            xl, yl = x.lower(), y.lower()
+            if xl != yl:
+                return 1 if xl > yl else -1
+    if len(ta) != len(tb):
+        return 1 if len(ta) > len(tb) else -1
+    return 0
+
+print(cmp(sys.argv[1], sys.argv[2]))
+PYVERSION
+}
+
+package_version_compare()
+{
+    local new_version="$1" new_release="$2" old_version="$3" old_release="$4"
+    local result
+    result="$(version_compare "$new_version" "$old_version")"
+    if [ "$result" -ne 0 ]; then
+        echo "$result"
+    else
+        version_compare "$new_release" "$old_release"
+    fi
+}
+
+confirm_update()
+{
+    local name="$1" old="$2" new="$3" answer
+    local lang="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+
+    if [[ "$lang" == de* ]]; then
+        printf '%s %s ist bereits installiert.\n' "$name" "$old"
+        printf 'Das angegebene Paket enthält %s %s.\n\n' "$name" "$new"
+        printf 'Möchten Sie das bereits installierte Paket aktualisieren? [j/N] '
+        IFS= read -r answer || answer=""
+        case "$answer" in j|J|ja|JA|Ja) return 0 ;; *) return 1 ;; esac
+    else
+        printf '%s %s is already installed.\n' "$name" "$old"
+        printf 'The specified package contains %s %s.\n\n' "$name" "$new"
+        printf 'Do you want to update the installed package? [y/N] '
+        IFS= read -r answer || answer=""
+        case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+    fi
+}
+
 cmd_install()
 {
     require_root
 
-    [ "$#" -eq 1 ] ||
-        die "Usage: bcraft install <package.tar.gz>"
+    parse_package_command_args install "$@"
 
     local package
-    package="$(readlink -f "$1")"
+    package="$(readlink -f "$PACKAGE_ARG")"
 
     [ -f "$package" ] ||
         die "Package not found: $package"
@@ -553,9 +947,51 @@ cmd_install()
 
     mkdir -p "$DBROOT"
 
-    [ ! -e "$dbdir" ] || {
+    if [ -e "$dbdir" ] && [ "$NODEPS" -eq 0 ]; then
+        local old_pkginfo="$dbdir/PKGINFO"
+        [ -f "$old_pkginfo" ] || {
+            rm -rf "$tmpdir"
+            die "Installed PKGINFO missing for $name"
+        }
+
+        local old_version old_release comparison
+        old_version="$(metadata "$old_pkginfo" version)"
+        old_release="$(metadata "$old_pkginfo" release)"
+        comparison="$(package_version_compare "$version" "$release" "$old_version" "$old_release")"
+
+        case "$comparison" in
+            1)
+                if confirm_update "$name" "$old_version-$old_release" "$version-$release"; then
+                    rm -rf "$tmpdir"
+                    if [ "$NODEPS" -eq 1 ]; then
+                        cmd_update --nodeps "$package"
+                    else
+                        cmd_update "$package"
+                    fi
+                    return
+                fi
+                rm -rf "$tmpdir"
+                echo "bcraft: Update cancelled" >&2
+                return 1
+                ;;
+            0)
+                rm -rf "$tmpdir"
+                die "$name $version-$release is already installed"
+                ;;
+            -1)
+                rm -rf "$tmpdir"
+                die "$name $old_version-$old_release is newer than $version-$release; downgrade refused"
+                ;;
+            *)
+                rm -rf "$tmpdir"
+                die "Could not compare package versions"
+                ;;
+        esac
+    fi
+
+    check_dependencies "$pkginfo" "$name" "$NODEPS" || {
         rm -rf "$tmpdir"
-        die "$name is already installed"
+        exit 1
     }
 
     local type hash path
@@ -569,7 +1005,7 @@ cmd_install()
 
         case "$type" in
             f|c|l)
-                if [ -e "/$path" ] || [ -L "/$path" ]; then
+                if [ "$NODEPS" -eq 0 ] && { [ -e "/$path" ] || [ -L "/$path" ]; }; then
                     rm -rf "$tmpdir"
                     die "File already exists: /$path"
                 fi
@@ -602,11 +1038,10 @@ cmd_update()
 {
     require_root
 
-    [ "$#" -eq 1 ] ||
-        die "Usage: bcraft update <package.tar.gz>"
+    parse_package_command_args update "$@"
 
     local package
-    package="$(readlink -f "$1")"
+    package="$(readlink -f "$PACKAGE_ARG")"
 
     [ -f "$package" ] ||
         die "Package not found: $package"
@@ -688,6 +1123,11 @@ cmd_update()
     [ "$name" = "$old_name" ] || {
         rm -rf "$tmpdir"
         die "Package name mismatch: installed $old_name, new $name"
+    }
+
+    check_dependencies "$pkginfo" "$name" "$NODEPS" || {
+        rm -rf "$tmpdir"
+        exit 1
     }
 
     local type hash path old_entry old_type old_hash
@@ -1018,6 +1458,10 @@ shift
 case "$command" in
     build)
         cmd_build "$@"
+        ;;
+
+    src-build)
+        cmd_src_build "$@"
         ;;
 
     install)

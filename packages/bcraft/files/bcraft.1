@@ -1,20 +1,26 @@
 .\" SPDX-License-Identifier: GPL-3.0-or-later
 .\" Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
-.TH BCRAFT 1 "September 2026" "bcraft 0.4.0" "Basecraft Linux"
+.TH BCRAFT 1 "September 2026" "bcraft 0.6.0" "Basecraft Linux"
 .SH NAME
 bcraft \- small build and binary package tool for Basecraft Linux
 .SH SYNOPSIS
 .B bcraft
 .B build
-.I package.src.tar.gz
+.I package.src.bcraft
+.PP
+.B bcraft
+.B src-build
+.RI [ recipe-dir ]
 .PP
 .B bcraft
 .B install
-.I package.tar.gz
+.RB [ --nodeps ]
+.I package.bcraft
 .PP
 .B bcraft
 .B update
-.I package.tar.gz
+.RB [ --nodeps ]
+.I package.bcraft
 .PP
 .B bcraft
 .B remove
@@ -36,26 +42,33 @@ bcraft \- small build and binary package tool for Basecraft Linux
 .B bcraft
 is a deliberately small build and package management tool for Basecraft Linux.
 It is designed around reproducible package recipes, staged installation into a
-package directory, binary tar.gz packages, manifests, and a small local package
+package directory, gzip-compressed tar archives with the .bcraft package suffix, manifests, and a small local package
 database.
 .PP
 bcraft does not perform automatic dependency solving or repository transactions.
+Recipes may declare simple package dependencies.  During install and update,
+bcraft verifies that those packages are registered in its local package database.
 Package recipes are expected to describe how software is built and installed.
 .SH COMMANDS
 .TP
-.BI "build " package.src.tar.gz
+.BI "build " package.src.bcraft
 Build a source recipe. Archive sources are downloaded and verified, the recipe
 is executed, files are staged in PKGDIR, a manifest is generated, and a binary
 package is written below /var/cache/basecraft/packages.
 .TP
-.BI "install " package.tar.gz
-Install a binary package and register its PKGINFO and MANIFEST below
-/var/lib/basecraft/packages.
+.BI "src-build " "[recipe-dir]"
+Create a bcraft source package from a recipe directory (the current directory by default). The directory must contain package.conf and build.sh. For archive sources, source_sha256="AUTO" may be used; bcraft downloads that source, calculates SHA-256, and writes the fixed hash only into the package.conf copy stored in the generated source package. The original recipe is not modified. Multi-source source_sha256s arrays may also contain AUTO entries. AUTO is never accepted by the normal build command.
 .TP
-.BI "update " package.tar.gz
+.BI "install " package.bcraft
+Install a binary package and register its PKGINFO and MANIFEST below
+/var/lib/basecraft/packages.  Declared package dependencies are checked before
+the payload is installed.
+.TP
+.BI "update " package.bcraft
 Update an already installed package. Files present in both package versions are
 replaced, obsolete package files are removed, and package metadata is updated.
-Configuration files receive special handling as described below.
+Configuration files receive special handling as described below.  Dependencies
+declared by the new package version are checked before the update is applied.
 .TP
 .BI "remove " package
 Remove files belonging to an installed package. Shared non-empty directories are
@@ -80,6 +93,31 @@ source_file and source_sha256.
 .PP
 Packages whose source is contained directly in the recipe may use
 source_mode="recipe".
+.SH DEPENDENCIES
+Recipes may declare simple dependencies.  They are stored in PKGINFO as repeated
+depend= entries.  During install and update, each dependency is considered
+satisfied when /var/lib/basecraft/packages/NAME/PKGINFO exists and identifies
+the same package name.
+.PP
+bcraft only checks dependency registration.  It does not download, resolve, or
+automatically install dependencies.  This is intentionally suitable for
+LFS/BLFS-style systems where software may already exist outside the bcraft
+package database.
+.PP
+.B --nodeps
+skips dependency checking and makes install proceed even if the package is
+already registered by bcraft or payload paths already exist on the target
+system. Existing payload paths are overwritten by the package. This is useful
+when adopting an existing LFS/BLFS installation into bcraft management.
+Architecture, Basecraft base, package integrity, and package structure checks
+remain active.
+.PP
+Examples:
+.PP
+.nf
+bcraft install --nodeps foo-1.0-1.bcraft
+bcraft update --nodeps foo-1.1-1.bcraft
+.fi
 .SH CONFIGURATION FILES
 Regular files below /etc are automatically treated as configuration files.
 Additional configuration files outside /etc can be declared in package.conf:
@@ -165,3 +203,25 @@ Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
 bcraft is licensed under the GNU General Public License version 3 or any later version.
 The complete license text is installed as
 /usr/share/licenses/bcraft/COPYING.
+.SH SMART INSTALL AND PACKAGE SUFFIXES
+Source packages use the filename suffix
+.B .src.bcraft
+and installable packages use
+.BR .bcraft .
+Both formats remain gzip-compressed tar archives internally.
+The suffix identifies the file as a bcraft package; bcraft still validates the
+package contents and metadata instead of trusting the filename alone.
+.PP
+When
+.B install
+is given a package whose name is already installed, bcraft compares version
+and release.  If the supplied package is newer, bcraft asks whether the
+installed package should be updated.  A positive answer enters the same update
+code path as an explicit
+.B update
+command.  The default answer is no.  If the versions are identical, install
+reports that the package is already installed.  If the supplied package is
+older, install refuses the downgrade.  The explicit
+.B update
+command remains available for scripts and for users who intentionally request
+an update operation.

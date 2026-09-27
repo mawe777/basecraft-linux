@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: GPL-3.0-or-later
 .\" Copyright (C) 2026 Marco Welter <mawe@tamaly.de>
-.TH BCRAFT-RECIPE 5 "September 2026" "bcraft 0.4.0" "Basecraft Linux"
+.TH BCRAFT-RECIPE 5 "September 2026" "bcraft 0.6.0" "Basecraft Linux"
 .SH NAME
 bcraft-recipe \- Source-Rezepte und Binärpakete für bcraft erstellen
 .SH BESCHREIBUNG
@@ -69,23 +69,127 @@ Optionale Maintainer-Angabe, zum Beispiel:
 maintainer="Marco Welter <mawe@tamaly.de>"
 .fi
 .TP
-.B source_mode
-archive oder recipe.
-.SH ARCHIV-SOURCES
-Bei source_mode="archive" werden zusätzlich definiert:
+.B depends
+Optionales Shell-Array mit Paketnamen, die zur Installations- bzw. Update-Zeit
+benötigt werden, zum Beispiel:
 .PP
 .nf
-source_url="https://example.org/foo-1.0.tar.gz"
-source_file="foo-1.0.tar.gz"
+depends=(
+    "ncurses"
+    "libfoo"
+)
+.fi
+.TP
+.B source_mode
+archive, local oder recipe.
+.SH ABHÄNGIGKEITEN
+Das optionale depends-Array stellt bewusst einfache Dependency-Metadaten bereit.
+Für jeden Eintrag schreibt bcraft eine depend=-Zeile in das erzeugte PKGINFO:
+.PP
+.nf
+depend=ncurses
+depend=libfoo
+.fi
+.PP
+Bei Installation und Update des Binärpakets prüft bcraft, ob jede Abhängigkeit
+unter /var/lib/basecraft/packages registriert ist. Versionsbedingungen,
+Alternativen, Provider oder rekursive Dependency-Ketten werden nicht aufgelöst;
+fehlende Pakete werden nicht automatisch installiert.
+.PP
+Auf einem bestehenden LFS-/BLFS-System kann eine Voraussetzung bereits vorhanden
+sein, ohne von bcraft verwaltet zu werden. In diesem Fall kann der Administrator
+die Abhängigkeitsprüfung ausdrücklich mit --nodeps überspringen:
+.PP
+.nf
+bcraft install --nodeps foo-1.0-1.bcraft
+.fi
+.PP
+--nodeps überspringt die Abhängigkeitsprüfung und erlaubt bei install außerdem
+die Installation über eine bestehende bcraft-Registrierung sowie über bereits
+vorhandene Nutzdatenpfade. Vorhandene Nutzdaten werden überschrieben. Prüfungen
+von Architektur, Basecraft-Basis, Paketintegrität und Paketstruktur bleiben aktiv.
+.SH SOURCES
+Bestehende Archiv-Rezepte mit einer einzelnen Quelle bleiben gültig:
+.PP
+.nf
+source_mode="archive"
+source_url="https://example.org/foo-1.0.tar.xz"
+source_file="foo-1.0.tar.xz"
 source_sha256="..."
 .fi
 .PP
-bcraft lädt den Source nach /var/cache/basecraft/sources, prüft SHA-256 und
-entpackt ihn in den Build-Baum.
+Für mehrere entfernte Quellen werden parallele Arrays verwendet. Einträge mit
+dem gleichen Index gehören zusammen:
+.PP
+.nf
+source_mode="archive"
+source_urls=(
+    "https://example.org/foo-1.0.tar.xz"
+    "https://example.org/foo-fix.patch"
+)
+source_files=(
+    "foo-1.0.tar.xz"
+    "foo-fix.patch"
+)
+source_sha256s=(
+    "SHA256-DES-ARCHIVS"
+    "SHA256-DES-PATCHES"
+)
+.fi
+.PP
+bcraft lädt jede Quelle nach /var/cache/basecraft/sources und prüft für jede
+Datei die SHA-256-Prüfsumme. Nur source_files[0] wird automatisch entpackt.
+Alle weiteren Quellen werden unverändert unter ihrem angegebenen Dateinamen in
+SRCDIR kopiert. build.sh kann sie beispielsweise so verwenden:
+.PP
+.nf
+cd "$SRCDIR"
+patch -Np1 -i foo-fix.patch
+.fi
+.PP
+Die drei Archiv-Arrays müssen gleich viele Einträge besitzen. Source-Dateinamen
+müssen einfache Basisnamen ohne Verzeichnisbestandteile sein.
+.SH LOKALE SOURCES
+Quellen, die direkt im bcraft-Source-Paket mitgeliefert werden, verwenden
+source_mode="local". Die Dateien liegen im Verzeichnis sources/ des Rezepts:
+.PP
+.nf
+source_mode="local"
+source_files=(
+    "foo-1.0.tar.xz"
+    "foo-fix.patch"
+)
+source_sha256s=(
+    "SHA256-DES-ARCHIVS"
+    "SHA256-DES-PATCHES"
+)
+.fi
+.PP
+Lokale Sources werden genauso geprüft wie heruntergeladene Sources. Die erste
+Datei wird als Hauptquelle entpackt; weitere Dateien werden unverändert nach
+SRCDIR kopiert. source_files und source_sha256s müssen gleich lang sein.
 .SH RECIPE-SOURCES
-Bei source_mode="recipe" liegen die Quelldateien direkt im Source-Paket.  Das
-eignet sich für Shell-Skripte, Basecraft-Werkzeuge, Konfigurationspakete und
-andere kleine lokale Projekte.
+Bei source_mode="recipe" liegen die Quelldateien direkt im Source-Paket. Das
+eignet sich weiterhin für Shell-Skripte, Basecraft-Werkzeuge,
+Konfigurationspakete und andere kleine lokale Projekte.
+.SH SRC-BUILD UND AUTO-PRÜFSUMMEN
+Ein SRC-Paket kann direkt aus einem Rezept-Verzeichnis erzeugt werden mit:
+.PP
+.nf
+bcraft src-build [rezept-verzeichnis]
+.fi
+.PP
+Das Verzeichnis muss mindestens package.conf und build.sh enthalten. Ohne Angabe wird das aktuelle Verzeichnis verwendet. Die erzeugte Datei heißt name-version-release.src.bcraft.
+.PP
+Für Archiv-Sources darf beim Erstellen des Rezepts source_sha256 auf AUTO gesetzt werden:
+.PP
+.nf
+source_sha256="AUTO"
+.fi
+.PP
+src-build lädt source_url/source_file, berechnet SHA-256 und ersetzt AUTO ausschließlich in der temporären package.conf-Kopie, die in das erzeugte SRC-Paket gelangt. Das ursprüngliche Rezept bleibt unverändert. Bei einem Multi-Source-Rezept dürfen entsprechend einzelne Einträge in source_sha256s AUTO enthalten; sie werden unabhängig aufgelöst.
+.PP
+AUTO ist ausschließlich eine Hilfe beim Erstellen eines SRC-Pakets. Ein normales bcraft build verlangt feste 64-stellige SHA-256-Werte und weist AUTO zurück. Für source_mode="local" wird AUTO nicht unterstützt, da diese Sources bereits Bestandteil des Rezepts sind.
 .SH BUILD.SH
 build.sh wird von bcraft ausgeführt und muss das vollständige Paket nach PKGDIR
 installieren.  Es darf nicht direkt in das laufende System installieren.
@@ -223,13 +327,13 @@ Nach dem Erstellen eines Rezeptverzeichnisses wird das Source-Paket mit tar
 gebaut:
 .PP
 .nf
-tar -czf foo-1.0-1.src.tar.gz foo/
+tar -czf foo-1.0-1.src.bcraft foo/
 .fi
 .PP
 Danach:
 .PP
 .nf
-bcraft build foo-1.0-1.src.tar.gz
+bcraft build foo-1.0-1.src.bcraft
 .fi
 .PP
 Das erzeugte Binärpaket liegt unter:
@@ -249,6 +353,10 @@ base="basecraft-1"
 description="JOE - Joe's Own Editor"
 license="GPL-3.0-or-later"
 maintainer="Ihr Name <name@example.org>"
+
+depends=(
+    "ncurses"
+)
 
 source_mode="archive"
 source_url="https://example.invalid/joe-4.8.tar.gz"
